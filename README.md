@@ -1,3 +1,4 @@
+
 ## 如何支持此项目？
 软件遵循GPL V3协议，是完全开源免费的，但开发者写代码、维护需要投入大量时间精力。
 大家的支持是项目得以延续的动力。
@@ -17,9 +18,9 @@ https://afdian.com/a/manong
 * Add below secrets in the  `Actions secrets and variables` settings of your repository.  
 <a href="/Documentation/screen1.png"><img src="/Documentation/screen1.png?raw=true" alt="Screenshot of Actions secrets" width="800"></a>  
   `KEY_ALIAS`:  Key alais of your key store file.
-  `KEY_PASSWORD`: key password of your key store file.
-  `STORE_FILE`: Path of your key store file in your repository.
-  `STORE_PASSWORD`: Store password of your key store file.
+  `KEY_PASSWORD`：您的密钥库文件的密钥密码。
+  `STORE_FILE`：在你的代码库中你的密钥库文件的路径。
+  `STORE_PASSWORD`：您的密钥库文件的存储密码。
 * Trigger build in Github Actions
 * Download the `aaps.zip` file in `Artifacts`
 
