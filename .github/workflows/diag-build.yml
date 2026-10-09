@@ -123,6 +123,28 @@ jobs:
           echo "----------------------"
           echo "keystore 已就绪: $(stat -c%s "$KS_FILE") 字节, alias='$ALIAS'"
 
+          # 私钥口令(KEY_PASSWORD)缺失时，自动尝试候选口令并校验
+          pick_key_password() {
+            local cand
+            for cand in "$STORE_PW" "$KEY_PW" "androidaps" "diyaps" "android" ""; do
+              if [ -z "$cand" ]; then continue; fi
+              if keytool -list -keystore "$KS_FILE" -storepass "$STORE_PW" -alias "$ALIAS" -keypass "$cand" > /dev/null 2>&1; then
+                echo "$cand"
+                return 0
+              fi
+            done
+            return 1
+          }
+          if [ -n "$STORE_PW" ]; then
+            PICKED=$(pick_key_password || true)
+            if [ -n "$PICKED" ]; then
+              KEY_PW="$PICKED"
+              echo "私钥口令校验通过（已选出口令，长度 ${#KEY_PW}）"
+            else
+              echo "::warning::未能确定私钥口令，打包签名可能失败；请补充 KEY_PASSWORD secret"
+            fi
+          fi
+
           echo "KEYSTORE_FILE=$KS_FILE" >> $GITHUB_ENV
           echo "KEYSTORE_PASSWORD=$STORE_PW" >> $GITHUB_ENV
           echo "KEY_ALIAS=$ALIAS" >> $GITHUB_ENV
