@@ -49,8 +49,10 @@ jobs:
           ALIAS=""
           STORE_PW=""
           KEY_PW=""
+          echo "secret presence: KEYSTORE_SET=${KEYSTORE_SET:+set} KEYSTORE_BASE64=${KEYSTORE_BASE64:+set} STORE_FILE=${STORE_FILE:+set}"
+          echo "secret presence: STORE_PASSWORD=${STORE_PASSWORD:+set} KEY_ALIAS=${KEY_ALIAS:+set} KEY_PASSWORD=${KEY_PASSWORD:+set}"
 
-          # 方案一: KEYSTORE_SET = base64(keystore)|storePassword|keyAlias|keyPassword
+          # 方案一: KEYSTORE_SET = base64(keystore|storePassword|keyAlias|keyPassword)
           if [ -n "$KEYSTORE_SET" ]; then
             echo "using KEYSTORE_SET"
             DECODED=$(printf '%s' "$KEYSTORE_SET" | base64 -d 2>/dev/null || true)
@@ -58,31 +60,47 @@ jobs:
             STORE_PW=$(printf '%s' "$DECODED" | cut -d'|' -f2)
             ALIAS=$(printf '%s' "$DECODED" | cut -d'|' -f3)
             KEY_PW=$(printf '%s' "$DECODED" | cut -d'|' -f4)
-            printf '%s' "$KS_B64" | base64 -d > "$KS_FILE"
-          # 方案二: KEYSTORE_BASE64 + 单独的密码 secret
-          elif [ -n "$KEYSTORE_BASE64" ]; then
+            printf '%s' "$KS_B64" | base64 -d > "$KS_FILE" 2>/dev/null || true
+          fi
+
+          # 方案二: KEYSTORE_BASE64 是 base64 编码的 keystore 内容
+          if [ ! -s "$KS_FILE" ] && [ -n "$KEYSTORE_BASE64" ]; then
             echo "using KEYSTORE_BASE64"
-            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS_FILE"
-            STORE_PW="$KS_PASSWORD"
-            [ -z "$STORE_PW" ] && STORE_PW="$STORE_PASSWORD"
-            ALIAS="$KS_ALIAS"
-            KEY_PW="$KS_KEY_PASSWORD"
-          # 方案三: STORE_FILE = base64(keystore)
-          elif [ -n "$STORE_FILE" ]; then
-            echo "using STORE_FILE"
-            printf '%s' "$STORE_FILE" | base64 -d > "$KS_FILE"
-            STORE_PW="$STORE_PASSWORD"
-            ALIAS="$KS_ALIAS"
-            KEY_PW="$KS_KEY_PASSWORD"
-          else
-            echo "::error::没有找到可用的 keystore secret（KEYSTORE_SET / KEYSTORE_BASE64 / STORE_FILE 全为空）"
-            echo "请检查仓库 Settings -> Secrets and variables -> Actions"
-            exit 1
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS_FILE" 2>/dev/null || true
+            STORE_PW="${STORE_PW:-$STORE_PASSWORD}"
+            ALIAS="${ALIAS:-$KEY_ALIAS}"
+            KEY_PW="${KEY_PW:-$KEY_PASSWORD}"
+          fi
+
+          # 方案三: STORE_FILE —— 仓库此处的约定是【仓库内路径】，不是 base64 内容
+          if [ ! -s "$KS_FILE" ] && [ -n "$STORE_FILE" ]; then
+            echo "using STORE_FILE = $STORE_FILE"
+            if [ -f "$STORE_FILE" ]; then
+              cp "$STORE_FILE" "$KS_FILE"
+            elif [ -f "$GITHUB_WORKSPACE/$STORE_FILE" ]; then
+              cp "$GITHUB_WORKSPACE/$STORE_FILE" "$KS_FILE"
+            else
+              # 兜底：尝试当作 base64 内容解码
+              printf '%s' "$STORE_FILE" | base64 -d > "$KS_FILE" 2>/dev/null || true
+            fi
+            STORE_PW="${STORE_PW:-$STORE_PASSWORD}"
+            ALIAS="${ALIAS:-$KEY_ALIAS}"
+            KEY_PW="${KEY_PW:-$KEY_PASSWORD}"
           fi
 
           if [ ! -s "$KS_FILE" ]; then
-            echo "::error::keystore 解码后为空"
+            echo "::error::keystore 未能解析（密钥存在但内容不可用，或全部为空）"
+            ls -la "$GITHUB_WORKSPACE/keystore" || true
             exit 1
+          fi
+
+          # 校验密码与别名是否匹配（失败也要给出清晰提示）
+          if [ -n "$STORE_PW" ]; then
+            if keytool -list -keystore "$KS_FILE" -storepass "$STORE_PW" > /dev/null 2>&1; then
+              echo "keystore 校验通过"
+            else
+              echo "::warning::keystore 密码校验失败（storepass 不匹配？）"
+            fi
           fi
           echo "keystore 已就绪: $(stat -c%s "$KS_FILE") 字节, alias='$ALIAS'"
 
