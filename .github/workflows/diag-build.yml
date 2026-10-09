@@ -1,0 +1,102 @@
+name: Diag Build (artifact)
+
+# Purpose: build the AAPS variant on the current branch and upload the APK
+# as a downloadable Actions artifact (signed with the repo's keystore secrets).
+on:
+  workflow_dispatch:
+    inputs:
+      buildVariant:
+        description: 'Build Variant'
+        required: true
+        default: 'fullRelease'
+        type: choice
+        options:
+          - fullRelease
+          - fullDebug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AAPS (artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Show what we are building
+        run: |
+          echo "ref = ${{ github.ref }}"
+          echo "sha = ${{ github.sha }}"
+          echo "actor = ${{ github.actor }}"
+          git log -1 --stat
+
+      - name: Decode keystore
+        run: |
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "::warning::KEYSTORE_BASE64 not configured, APK will be unsigned"
+          else
+            mkdir -p "$RUNNER_TEMP/keystore"
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+            echo "keystore size: $(stat -c%s "$RUNNER_TEMP/keystore/keystore.jks") bytes"
+          fi
+
+      - name: Load JDK version
+        run: |
+          JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
+          echo "JAVA_VERSION=$JAVA_VERSION" >> $GITHUB_ENV
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Extract VERSION
+        run: |
+          VERSION=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version: $VERSION"
+
+      - name: Build APK
+        run: |
+          ./gradlew :app:assemble${{ github.event.inputs.buildVariant }} \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            -Dkotlin.daemon.jvm.options="-Xmx2g" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.daemon=true \
+            -Dorg.gradle.workers.max=8 \
+            -Dorg.gradle.caching=true \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
+            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
+            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+
+      - name: Collect and rename APK
+        run: |
+          set -e
+          VARIANT="${{ github.event.inputs.buildVariant }}"
+          FLAVOR=$(echo "$VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
+          TYPE=$(echo "$VARIANT" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
+          SRC="app/build/outputs/apk/${FLAVOR}/${TYPE}"
+          echo "source dir: $SRC"
+          ls -la "$SRC"
+          mkdir -p out
+          for f in "$SRC"/*.apk; do
+            cp "$f" "out/aaps-diag-${VERSION}-${VARIANT}.apk"
+          done
+          ls -la out/
+          sha256sum out/*.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-diag-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 7
