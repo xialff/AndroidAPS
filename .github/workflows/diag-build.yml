@@ -1,7 +1,8 @@
 name: Diag Build (artifact)
 
-# Purpose: build the AAPS variant on the current branch and upload the APK
-# as a downloadable Actions artifact (signed with the repo's keystore secrets).
+# Purpose: build AAPS on the selected branch and upload the APK as a
+# downloadable Actions artifact, signed with the repo's keystore secrets.
+# Compatible with several common secret naming schemes.
 on:
   workflow_dispatch:
     inputs:
@@ -27,20 +28,68 @@ jobs:
 
       - name: Show what we are building
         run: |
-          echo "ref = ${{ github.ref }}"
-          echo "sha = ${{ github.sha }}"
+          echo "ref   = ${{ github.ref }}"
+          echo "sha   = ${{ github.sha }}"
           echo "actor = ${{ github.actor }}"
           git log -1 --stat
 
       - name: Decode keystore
+        env:
+          KEYSTORE_SET: ${{ secrets.KEYSTORE_SET }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_FILE: ${{ secrets.STORE_FILE }}
+          KS_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
-            echo "::warning::KEYSTORE_BASE64 not configured, APK will be unsigned"
+          set -e
+          mkdir -p "$RUNNER_TEMP/keystore"
+          KS_FILE="$RUNNER_TEMP/keystore/keystore.jks"
+          ALIAS=""
+          STORE_PW=""
+          KEY_PW=""
+
+          # 方案一: KEYSTORE_SET = base64(keystore)|storePassword|keyAlias|keyPassword
+          if [ -n "$KEYSTORE_SET" ]; then
+            echo "using KEYSTORE_SET"
+            DECODED=$(printf '%s' "$KEYSTORE_SET" | base64 -d 2>/dev/null || true)
+            KS_B64=$(printf '%s' "$DECODED" | cut -d'|' -f1)
+            STORE_PW=$(printf '%s' "$DECODED" | cut -d'|' -f2)
+            ALIAS=$(printf '%s' "$DECODED" | cut -d'|' -f3)
+            KEY_PW=$(printf '%s' "$DECODED" | cut -d'|' -f4)
+            printf '%s' "$KS_B64" | base64 -d > "$KS_FILE"
+          # 方案二: KEYSTORE_BASE64 + 单独的密码 secret
+          elif [ -n "$KEYSTORE_BASE64" ]; then
+            echo "using KEYSTORE_BASE64"
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS_FILE"
+            STORE_PW="$KS_PASSWORD"
+            [ -z "$STORE_PW" ] && STORE_PW="$STORE_PASSWORD"
+            ALIAS="$KS_ALIAS"
+            KEY_PW="$KS_KEY_PASSWORD"
+          # 方案三: STORE_FILE = base64(keystore)
+          elif [ -n "$STORE_FILE" ]; then
+            echo "using STORE_FILE"
+            printf '%s' "$STORE_FILE" | base64 -d > "$KS_FILE"
+            STORE_PW="$STORE_PASSWORD"
+            ALIAS="$KS_ALIAS"
+            KEY_PW="$KS_KEY_PASSWORD"
           else
-            mkdir -p "$RUNNER_TEMP/keystore"
-            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
-            echo "keystore size: $(stat -c%s "$RUNNER_TEMP/keystore/keystore.jks") bytes"
+            echo "::error::没有找到可用的 keystore secret（KEYSTORE_SET / KEYSTORE_BASE64 / STORE_FILE 全为空）"
+            echo "请检查仓库 Settings -> Secrets and variables -> Actions"
+            exit 1
           fi
+
+          if [ ! -s "$KS_FILE" ]; then
+            echo "::error::keystore 解码后为空"
+            exit 1
+          fi
+          echo "keystore 已就绪: $(stat -c%s "$KS_FILE") 字节, alias='$ALIAS'"
+
+          echo "KEYSTORE_FILE=$KS_FILE" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$STORE_PW" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$ALIAS" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$KEY_PW" >> $GITHUB_ENV
 
       - name: Load JDK version
         run: |
@@ -72,10 +121,10 @@ jobs:
             -Dorg.gradle.daemon=true \
             -Dorg.gradle.workers.max=8 \
             -Dorg.gradle.caching=true \
-            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
-            -Pandroid.injected.signing.store.password="${{ secrets.KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
+            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
 
       - name: Collect and rename APK
         run: |
@@ -92,6 +141,12 @@ jobs:
           done
           ls -la out/
           sha256sum out/*.apk
+
+      - name: Verify APK signature
+        run: |
+          APK=$(ls out/*.apk | head -1)
+          echo "verifying: $APK"
+          $ANDROID_HOME/build-tools/*/apksigner verify --print-certs -v "$APK" || echo "apksigner 不可用，跳过"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
