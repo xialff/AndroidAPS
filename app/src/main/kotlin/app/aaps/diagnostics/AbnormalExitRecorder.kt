@@ -89,6 +89,9 @@ object AbnormalExitRecorder {
         appContext = ctx
         if (!installed.compareAndSet(false, true)) return
 
+        // registerActivityLifecycleCallbacks 是 Application 的方法，Context 上没有
+        val app = (ctx as? Application) ?: (context as? Application)
+
         try {
             prevUncaughtHandler = Thread.getDefaultUncaughtExceptionHandler()
             Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -106,8 +109,8 @@ object AbnormalExitRecorder {
 
         // 前/后台打点：只用 framework 的 ActivityLifecycleCallbacks，不引入任何新依赖。
         // 与心跳互相印证，可看出"退到后台后多久被杀"。
-        runCatching {
-            ctx.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+        if (app != null) runCatching {
+            app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
                 private var started = 0
                 private var foreground = false
 
