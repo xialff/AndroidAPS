@@ -43,6 +43,7 @@ import app.aaps.core.ui.extensions.runOnUiThread
 import app.aaps.core.ui.locale.LocaleHelper
 import app.aaps.core.utils.JsonHelper
 import app.aaps.database.persistence.CompatDBHelper
+import app.aaps.diagnostics.AbnormalExitRecorder
 import app.aaps.di.AppComponent
 import app.aaps.di.DaggerAppComponent
 import app.aaps.implementation.lifecycle.ProcessLifecycleListener
@@ -115,6 +116,9 @@ class MainApp : DaggerApplication() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // 异常退出诊断（黑匣子）：必须最早安装，才能捕获启动期崩溃并读取上次退出原因
+        AbnormalExitRecorder.install(this)
 
         // Here should be everything injected
         aapsLogger.debug("onCreate")
@@ -193,6 +197,7 @@ class MainApp : DaggerApplication() {
         handler.postDelayed(refreshWidget, 60000)
         config.appInitialized = true
         aapsLogger.debug("doInit end")
+        AbnormalExitRecorder.noteAapsReady()
     }
 
     private fun setRxErrorHandler() {
@@ -473,6 +478,7 @@ class MainApp : DaggerApplication() {
 
     override fun onTerminate() {
         aapsLogger.debug(LTag.CORE, "onTerminate")
+        AbnormalExitRecorder.noteCleanShutdown()
         handler.removeCallbacksAndMessages(null)
         handler.looper.quitSafely()
         unregisterReceivers()
