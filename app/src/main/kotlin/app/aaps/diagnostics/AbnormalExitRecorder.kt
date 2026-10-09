@@ -3,6 +3,7 @@ package app.aaps.diagnostics
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.Application
+import android.app.ApplicationExitInfo
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter

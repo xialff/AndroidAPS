@@ -96,9 +96,9 @@ jobs:
             fi
           fi
 
-          # 别名兜底：demo keystore 的别名是 androidaps
+          # 别名兜底：仓库自带 demokeystore.jks 的真实别名是 diyaps
           if [ -z "$ALIAS" ]; then
-            ALIAS="androidaps"
+            ALIAS="diyaps"
             echo "alias 未提供，回退为 '$ALIAS'"
           fi
 
