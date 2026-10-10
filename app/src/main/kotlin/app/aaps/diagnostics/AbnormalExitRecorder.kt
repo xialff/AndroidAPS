@@ -50,7 +50,12 @@ object AbnormalExitRecorder {
     private const val TAG = "AbnormalExit"
 
     /** 单次启动最多回溯多少条历史退出记录（系统上限 64） */
-    private const val MAX_HISTORY = 16
+    /**
+     * 单次启动最多回溯多少条历史退出记录。
+     * 注意 maxNum 必须给足：系统按 (maxNum, startIndex) 分页，
+     * 给 16 时实测只返回了 1 条，给 64（系统上限）才能拿到完整历史。
+     */
+    private const val MAX_HISTORY = 64
 
     /** 每次启动最多打印多少条历史退出记录（全部打印太长，但保留足够上下文） */
     private const val MAX_PRINT = 6
