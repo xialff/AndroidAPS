@@ -52,6 +52,9 @@ object AbnormalExitRecorder {
     /** 单次启动最多回溯多少条历史退出记录（系统上限 64） */
     private const val MAX_HISTORY = 16
 
+    /** 每次启动最多打印多少条历史退出记录（全部打印太长，但保留足够上下文） */
+    private const val MAX_PRINT = 6
+
     /** 心跳间隔（分钟） */
     private const val HEARTBEAT_MINUTES = 5L
 
@@ -157,9 +160,8 @@ object AbnormalExitRecorder {
 
     private fun recordStartup(ctx: Context) {
         val myPid = Process.myPid()
-        // Process.getStartUptimeMillis() 与 SystemClock.uptimeMillis() 同一时基（API 24+）
+        val myStartWall = myProcessStartWallClock()
         val myStartUptime = Process.getStartUptimeMillis()
-        val myStartWall = bootWall() + myStartUptime
 
         write(
             "START",
@@ -170,9 +172,11 @@ object AbnormalExitRecorder {
                 .append(", api=").append(Build.VERSION.SDK_INT)
                 .append(", release=").append(Build.VERSION.RELEASE)
                 .append(", build=").append(Build.DISPLAY)
+                .append(", 本进程启动于=").append(tsFormat.format(Date(myStartWall)))
+                .append(" (uptime=").append(myStartUptime / 1000).append("s)")
                 .toString()
         )
-        write("MEM", memorySummary(ctx))
+        write("MEM", "启动初内存: " + memorySummaryOrEmpty(ctx))
 
         val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
         if (am == null) {
@@ -187,19 +191,37 @@ object AbnormalExitRecorder {
             .getOrNull()
 
         if (reasons.isNullOrEmpty()) {
-            write("EXIT", "没有可用的历史退出记录（系统已清理，或本进程是首个进程）")
+            write("EXIT", "系统没有返回任何历史退出记录（本进程可能是安装后首个进程）")
             scheduleHeartbeat(ctx)
             return
         }
 
-        // 上一个进程 = 启动时间早于本进程的最新的那条记录
-        val previous = reasons
+        // 系统返回按时间倒序（最新在前）。全部打印出来，避免"挑错那一条"。
+        val sorted = reasons.sortedByDescending { runCatching { it.timestamp }.getOrDefault(0L) }
+        write(
+            "EXIT-HISTORY",
+            "系统返回 ${sorted.size} 条退出记录（可能有脱敏：异常进程的 timestamp/pss/description 会被系统清零）"
+        )
+        sorted.take(MAX_PRINT).forEachIndexed { idx, info ->
+            write("EXIT-HISTORY", describe(info, idx, myStartWall, myPid))
+        }
+        if (sorted.size > MAX_PRINT) {
+            write("EXIT-HISTORY", "... 其余 ${sorted.size - MAX_PRINT} 条已省略（只影响展示，不影响判读）")
+        }
+
+        // 结论：找出"本进程之前"最近的一次退出
+        val previous = sorted
             .filter { it.pid != myPid }
-            .filter { it.timestamp <= myStartWall }
+            .filter { runCatching { it.timestamp }.getOrDefault(0L) in 1..myStartWall }
             .maxByOrNull { it.timestamp }
 
         if (previous == null) {
-            write("EXIT", "未找到上一个进程的退出记录（history=${reasons.size}, myStart=$myStartWall）")
+            val usable = sorted.count { runCatching { it.timestamp }.getOrDefault(0L) > 0L }
+            write(
+                "EXIT",
+                "本进程之前没有可识别的退出记录（记录总数=${sorted.size}，其中带有效时间戳的=$usable，" +
+                    "本进程 pid=$myPid 启动于 ${tsFormat.format(Date(myStartWall))}）"
+            )
             scheduleHeartbeat(ctx)
             return
         }
@@ -207,53 +229,83 @@ object AbnormalExitRecorder {
         val normal = previous.reason == ApplicationExitInfo.REASON_USER_REQUESTED ||
             previous.reason == ApplicationExitInfo.REASON_USER_STOPPED
 
-        write(if (normal) "EXIT-NORMAL" else "EXIT-ABNORMAL", describe(previous, myStartWall, myStartUptime))
+        write(
+            if (normal) "EXIT-NORMAL" else "EXIT-ABNORMAL",
+            describe(previous, -1, myStartWall, myPid) +
+                ", 距本进程启动=" + fmtDuration(myStartWall - previous.timestamp)
+        )
         dumpTrace(ctx, previous)
         scheduleHeartbeat(ctx)
     }
 
-    private fun describe(info: ApplicationExitInfo, myStartWall: Long, myStartUptime: Long): String {
+    /** idx >= 0 表示历史列表项；idx < 0 表示"上一个进程" */
+    private fun describe(info: ApplicationExitInfo, idx: Int, myStartWall: Long, myPid: Int): String {
         val sb = StringBuilder()
+        if (idx >= 0) sb.append('#').append(idx + 1).append(' ')
         sb.append("reason=").append(reasonName(info.reason)).append("(code=").append(info.reason).append(')')
+
+        val ts = runCatching { info.timestamp }.getOrDefault(0L)
         sb.append(", importance=").append(importanceName(info.importance))
-        sb.append(", status=").append(info.status)
-        sb.append(", pid=").append(info.pid)
+        sb.append(", status=").append(runCatching { info.status }.getOrDefault(-1))
+        sb.append(", pid=").append(info.pid).append(if (info.pid == myPid) "(=当前进程)" else "")
+        sb.append(", exitTime=").append(if (ts > 0) tsFormat.format(Date(ts)) else "(系统未提供/已脱敏)")
         sb.append(", pss=").append(kb(info.pss)).append(", rss=").append(kb(info.rss))
-        sb.append(", exitWall=").append(tsFormat.format(Date(info.timestamp)))
 
         runCatching {
-            if (info.description != null) sb.append(", description=").append(info.description)
+            if (!info.description.isNullOrBlank()) sb.append(", description=").append(info.description)
+        }
+
+        if (ts > 0 && myStartWall > ts) {
+            sb.append(", 距本次启动=").append(fmtDuration(myStartWall - ts))
         }
         if (info.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND_SERVICE ||
             info.importance == ActivityManager.RunningAppProcessInfo.IMPORTANCE_SERVICE
         ) {
-            sb.append(" [退出时处于服务状态 → 系统/厂商后台清理的典型特征]")
+            sb.append(" [退出时持有前台服务]")
         }
-        // 本进程起点（uptime 基准） - 上次退出（换算到 uptime 基准）= 死亡到重启的间隔
-        val exitUptime = info.timestamp - bootWall()
-        val gap = myStartUptime - exitUptime
-        if (gap in 0..(24L * 3600L * 1000L)) {
-            sb.append(", 死亡→重启间隔=").append(gap / 1000).append('s')
-        }
-        if (info.timestamp > 0 && myStartWall > info.timestamp) {
-            sb.append(", 上次退出距今=").append((myStartWall - info.timestamp) / 1000).append('s')
+        if (ts <= 0L) {
+            sb.append(" [该条记录已被系统脱敏，字段不可信]")
         }
         return sb.toString()
     }
 
+    private fun fmtDuration(ms: Long): String {
+        if (ms <= 0) return "0s"
+        val sec = ms / 1000
+        return when {
+            sec < 60 -> "${sec}s"
+            sec < 3600 -> "${sec / 60}分${sec % 60}秒"
+            else -> "${sec / 3600}小时${(sec % 3600) / 60}分"
+        }
+    }
+
     /**
-     * 上次开机时刻（wall clock）。
-     * uptimeMillis 与 elapsedRealtime 同源，故 开机wall = now - elapsedRealtime。
+     * 本进程的启动时刻（wall clock）。
+     *
+     * 注意：必须用 uptimeMillis 作为时基。Process.getStartUptimeMillis() 返回的是
+     * uptimeMillis 基准（不包含深睡），而 SystemClock.elapsedRealtime() 含深睡；
+     * 二者混用会让算出的启动时刻偏小，从而把最近几次真实退出记录全部过滤掉
+     * —— 这正是旧版本"总是读到最旧那条记录"的原因。
      */
-    private fun bootWall(): Long = System.currentTimeMillis() - SystemClock.elapsedRealtime()
+    private fun myProcessStartWallClock(): Long {
+        val startUptime = Process.getStartUptimeMillis()
+        if (startUptime > 0) {
+            return System.currentTimeMillis() - (SystemClock.uptimeMillis() - startUptime)
+        }
+        // 极少数 ROM 上返回 0，退回"当前时刻"（宁可保守，也不伪造时间）
+        return System.currentTimeMillis()
+    }
 
     private fun dumpTrace(ctx: Context, info: ApplicationExitInfo) {
         try {
             val stream = info.traceInputStream ?: return
             stream.use { input ->
+                // timestamp 可能为 0（被系统脱敏），此时用当前时间命名避免覆盖
+                val ts = runCatching { info.timestamp }.getOrDefault(0L).takeIf { it > 0 }
+                    ?: System.currentTimeMillis()
                 val target = File(
                     dir(ctx),
-                    "exit_trace_${fileTsFormat.format(Date(info.timestamp))}_${reasonShort(info.reason)}.txt"
+                    "exit_trace_${fileTsFormat.format(Date(ts))}_${reasonShort(info.reason)}.txt"
                 )
                 target.outputStream().use { output ->
                     val buf = ByteArray(8192)
@@ -360,21 +412,26 @@ object AbnormalExitRecorder {
     // 工具
     // ------------------------------------------------------------------
 
-    private fun memorySummary(ctx: Context?): String = "MEM " + memorySummaryOrEmpty(ctx)
-
     private fun memorySummaryOrEmpty(ctx: Context?): String {
         val sb = StringBuilder()
         runCatching {
-            sb.append("pss=").append(kb(Debug.getPss()))
-            sb.append(", javaHeapUsed=").append(mb(Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()))
-            sb.append(", javaHeapMax=").append(mb(Runtime.getRuntime().maxMemory()))
-            sb.append(", nativeHeapAllocated=").append(kb(Debug.getNativeHeapAllocatedSize()))
+            // 注意：Debug.getPss() 在部分厂商 ROM 上返回无意义的极小值，
+            // 因此改用 Debug.MemoryInfo（getTotalPss 单位 kB）作为主指标。
+            val mi = Debug.MemoryInfo()
+            Debug.getMemoryInfo(mi)
+            sb.append("totalPss=").append(mi.totalPss / 1024).append("MB")
+            sb.append(", dalvikPss=").append(mi.dalvikPss / 1024).append("MB")
+            sb.append(", nativePss=").append(mi.nativePss / 1024).append("MB")
+            sb.append(", javaHeapUsed=")
+                .append((Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / 1024 / 1024)
+                .append("MB")
+            sb.append(", javaHeapMax=").append(Runtime.getRuntime().maxMemory() / 1024 / 1024).append("MB")
         }
         if (ctx != null) {
             runCatching {
                 val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+                sb.append(", memoryClass=").append(am.memoryClass).append("MB")
                 sb.append(", lowRamDevice=").append(am.isLowRamDevice)
-                sb.append(", memClass=").append(mb(am.memoryClass.toLong()))
             }
         }
         return sb.toString()
@@ -454,7 +511,6 @@ object AbnormalExitRecorder {
     }
 
     private fun kb(bytes: Long): String = "${bytes / 1024}KB"
-    private fun mb(bytes: Long): String = "${bytes / 1024 / 1024}MB"
 
     private fun safeLog(message: String) {
         runCatching { Log.w(TAG, message) }
