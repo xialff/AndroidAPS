@@ -193,6 +193,28 @@ class RileyLinkBLE @Inject constructor(
         }
     }
 
+    /**
+     * 供上层（RileyLinkService 的连接健康检查）调用的主动重连入口。
+     * 幂等：已连接或已在调度中时不重复动作。
+     */
+    @SuppressLint("MissingPermission")
+    fun reconnectIfNeeded() {
+        if (isConnected) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "reconnectIfNeeded: already connected, nothing to do")
+            return
+        }
+        if (watchdogScheduled) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "reconnectIfNeeded: reconnect already scheduled")
+            return
+        }
+        aapsLogger.warn(LTag.PUMPBTCOMM, "reconnectIfNeeded: forcing GATT release and reconnect")
+        manualDisconnect = false
+        safeCloseExistingGatt()
+        scheduleConnectionWatchdog()
+        val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
+        if (useScanning) orangeLink.startScan() else connectGattInternal()
+    }
+
     fun connectGatt() {
         scheduleConnectionWatchdog()
         val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
