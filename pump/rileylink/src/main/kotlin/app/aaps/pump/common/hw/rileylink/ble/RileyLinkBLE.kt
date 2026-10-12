@@ -19,6 +19,7 @@ import androidx.core.content.ContextCompat
 import app.aaps.core.interfaces.configuration.Config
 import app.aaps.core.interfaces.logging.AAPSLogger
 import app.aaps.core.interfaces.logging.LTag
+import app.aaps.core.interfaces.plugin.ActivePlugin
 import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.core.utils.pump.ByteUtil
 import app.aaps.core.utils.pump.ThreadUtil
@@ -55,7 +56,12 @@ class RileyLinkBLE @Inject constructor(
     private val rileyLinkUtil: RileyLinkUtil,
     private val preferences: Preferences,
     private val orangeLink: OrangeLinkImpl,
-    private val config: Config
+    private val config: Config,
+    /**
+     * 只用于"安全性查询"：判断泵当前是否正在执行命令（例如正在输注 bolus）。
+     * 看门狗在泵忙碌时绝不重建连接 —— 见 scheduleConnectionWatchdog()。
+     */
+    private val activePlugin: ActivePlugin
 ) {
 
     companion object {
@@ -262,20 +268,53 @@ class RileyLinkBLE @Inject constructor(
      */
     private fun scheduleConnectionWatchdog() {
         if (watchdogScheduled) return
+        // 用户主动断开（配置页移除 RL / 服务销毁）后不得自动重连
+        if (manualDisconnect) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Connection watchdog not scheduled: manual disconnect is active")
+            return
+        }
         watchdogScheduled = true
         watchdogHandler.postDelayed({
-            watchdogScheduled = false
+            if (manualDisconnect) {
+                watchdogScheduled = false
+                return@postDelayed
+            }
             if (isConnected) {
+                watchdogScheduled = false
                 watchdogRestarts = 0
                 return@postDelayed
             }
+
+            // ★ 输注安全闸 ★
+            // 泵正在执行命令（例如正在输注 bolus / 设置临时基础率）时，
+            // 绝不允许强制断开重连：那会让 AAPS 无法确认命令是否已下发，
+            // 造成"泵已输注但 AAPS 认为失败"的剂量记录错乱。
+            // 此时只记录并继续等待，等泵空闲后再重建连接。
+            if (isPumpBusy()) {
+                aapsLogger.warn(
+                    LTag.PUMPBTCOMM,
+                    "Connection watchdog: pump is busy executing a command, " +
+                        "postponing rebuild (connection must NOT be interrupted during delivery)"
+                )
+                // 必须复位标记，否则本方法会被开头的 if (watchdogScheduled) 吃掉，
+                // 看门狗就永久停了
+                watchdogScheduled = false
+                scheduleConnectionWatchdog()
+                return@postDelayed
+            }
+
             if (watchdogRestarts >= WATCHDOG_MAX_RESTARTS) {
+                // 达到重建上限：复位标记后直接排下一次触发。
+                // 注意必须复位 watchdogScheduled，否则下面这次调度会被开头的
+                // "if (watchdogScheduled) return" 直接吃掉，看门狗永久停止
+                // —— 那就等于又回到"必须重启 AAPS"。
                 aapsLogger.error(
                     LTag.PUMPBTCOMM,
                     "Connection watchdog: rebuilt $watchdogRestarts times without success, " +
-                        "waiting ${CONNECTION_WATCHDOG_RETRY_AFTER_GIVE_UP_MS / 1000}s before next attempt"
+                        "waiting ${CONNECTION_WATCHDOG_RETRY_AFTER_GIVE_UP_MS / 1000}s before next round"
                 )
                 watchdogRestarts = 0
+                watchdogScheduled = false
                 watchdogHandler.postDelayed({ scheduleConnectionWatchdog() }, CONNECTION_WATCHDOG_RETRY_AFTER_GIVE_UP_MS)
                 return@postDelayed
             }
@@ -285,14 +324,24 @@ class RileyLinkBLE @Inject constructor(
                 "Connection watchdog fired: not connected after ${CONNECTION_WATCHDOG_TIMEOUT_MS / 1000}s, " +
                     "force rebuild (attempt $watchdogRestarts/$WATCHDOG_MAX_RESTARTS)"
             )
-            // 清掉可能残留的 GATT，避免泄漏累积
+            // 清掉可能残留的 GATT，避免泄漏累积（此处泵空闲，不会打断输注）
             safeCloseExistingGatt()
             val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
             if (useScanning) orangeLink.startScan() else connectGattInternal()
-            // 继续守着
+            // 继续守着：先复位标记，再排下一次
+            watchdogScheduled = false
             scheduleConnectionWatchdog()
         }, CONNECTION_WATCHDOG_TIMEOUT_MS)
     }
+
+    /**
+     * 泵是否正在执行命令（含输注）。
+     * 任何异常都按"忙碌"处理（fail-safe）：宁可不重连，也不能打断可能的输注。
+     */
+    private fun isPumpBusy(): Boolean =
+        runCatching { activePlugin.activePump.isBusy() }
+            .onFailure { aapsLogger.debug(LTag.PUMPBTCOMM, "isPumpBusy check failed, assuming busy: ${it.message}") }
+            .getOrDefault(true)
 
     /** 连接成功或用户主动断开时取消看门狗并复位计数 */
     private fun cancelConnectionWatchdog() {
@@ -521,19 +570,21 @@ class RileyLinkBLE @Inject constructor(
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
                     if (manualDisconnect) {
+                        // 用户主动断开：不自动重连
                         close()
                         manualDisconnect = false
                         cancelConnectionWatchdog()
+                        aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected (manual, no auto reconnect).")
                     } else {
-                        // 关键修复：非用户主动断开（链路自己掉了 / 厂商栈断开）时，
+                        // 非用户主动断开（链路自己掉了 / 厂商蓝牙栈断开）：
                         // 原实现什么都不做，只能等上层重新发起，很容易永久卡住。
-                        // 这里释放可能残留的 GATT 并挂上看门狗，由看门狗负责自动重建连接。
+                        // 这里释放可能残留的 GATT 并挂看门狗，由看门狗负责自动重建连接。
                         runCatching { gatt.close() }
                         if (bluetoothConnectionGatt === gatt) bluetoothConnectionGatt = null
                         isConnected = false
                         scheduleConnectionWatchdog()
+                        aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected unexpectedly - watchdog will rebuild the connection.")
                     }
-                    aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
                 } else {
                     aapsLogger.warn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
                 }
