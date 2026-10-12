@@ -12,6 +12,8 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
 import app.aaps.core.interfaces.configuration.Config
@@ -56,7 +58,35 @@ class RileyLinkBLE @Inject constructor(
     private val config: Config
 ) {
 
+    companion object {
+
+        /**
+         * 连接看门狗超时（毫秒）。
+         *
+         * 背景：Android 的 GATT 回调在某些情况下会静默丢失（厂商蓝牙栈问题）。
+         * 此时 connectGatt() 已发出但 onConnectionStateChange 永远不来，
+         * AAPS 会永远卡在 CONNECTING（实测可卡 26 分钟以上、反复重试 11 次），
+         * 只有杀掉进程重启才能恢复——因为只有进程销毁才会回收泄漏的 GATT client。
+         *
+         * 这里加一个看门狗：超过该时间仍未连上就强制释放并重建连接。
+         */
+        private const val CONNECTION_WATCHDOG_TIMEOUT_MS = 45_000L
+
+        /** 看门狗最多连续重建几次（避免无限重建耗尽蓝牙栈资源） */
+        private const val WATCHDOG_MAX_RESTARTS = 5
+
+        /** 连续重建达到上限后，等这么久再重新开始一轮 */
+        private const val CONNECTION_WATCHDOG_RETRY_AFTER_GIVE_UP_MS = 5 * 60_000L
+    }
+
     private val gattDebugEnabled = true
+
+    /** 看门狗用的主线程 Handler */
+    private val watchdogHandler = Handler(Looper.getMainLooper())
+    private var watchdogRestarts = 0
+
+    /** 是否已排入看门狗（幂等保护，避免重复调度与互相取消） */
+    private var watchdogScheduled = false
     private var manualDisconnect = false
 
     //val bluetoothAdapter: BluetoothAdapter = BluetoothAdapter.getDefaultAdapter()
@@ -142,6 +172,9 @@ class RileyLinkBLE @Inject constructor(
         aapsLogger.debug(LTag.PUMPBTCOMM, "RileyLink address: $rileyLinkAddress")
         // Must verify that this is a valid MAC, or crash.
         //macAddress = RileyLinkAddress;
+        // 无论走哪条路径，都要挂上连接看门狗：
+        // 扫描失败（没扫到设备）时原实现只会静默停下，永远不再重试。
+        scheduleConnectionWatchdog()
         val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
         if (useScanning) {
             aapsLogger.debug(LTag.PUMPBTCOMM, "Start scan for OrangeLink device.")
@@ -155,6 +188,7 @@ class RileyLinkBLE @Inject constructor(
     }
 
     fun connectGatt() {
+        scheduleConnectionWatchdog()
         val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
         if (useScanning) {
             aapsLogger.debug(LTag.PUMPBTCOMM, "Start scan for OrangeLink device.")
@@ -167,6 +201,14 @@ class RileyLinkBLE @Inject constructor(
     // This function must be run on UI thread.
     @SuppressLint("HardwareIds")
     fun connectGattInternal() {
+        // 关键修复：建立新连接前必须先释放旧的 GATT 对象。
+        // 原实现直接覆盖 bluetoothConnectionGatt 引用，旧对象只有在收到
+        // onConnectionStateChange(STATE_DISCONNECTED) 时才会被 close()。
+        // 一旦该回调丢失（厂商蓝牙栈问题），GATT client 资源就永久泄漏，
+        // 后续 connectGatt() 会被蓝牙栈静默拒绝且不产生任何回调，
+        // 表现为 AAPS 永远卡在 CONNECTING，必须重启进程才能恢复。
+        safeCloseExistingGatt()
+
         if (rileyLinkDevice == null) {
             aapsLogger.error(LTag.PUMPBTCOMM, "RileyLink device is null, can't do connectGatt.")
             return
@@ -176,9 +218,10 @@ class RileyLinkBLE @Inject constructor(
             return
         } else bluetoothConnectionGatt = rileyLinkDevice?.connectGatt(context, true, bluetoothGattCallback)
         // , BluetoothDevice.TRANSPORT_LE
-        if (bluetoothConnectionGatt == null)
+        if (bluetoothConnectionGatt == null) {
             aapsLogger.error(LTag.PUMPBTCOMM, "Failed to connect to Bluetooth Low Energy device at " + bluetoothAdapter?.address)
-        else {
+            scheduleConnectionWatchdog()
+        } else {
             if (gattDebugEnabled) aapsLogger.debug(LTag.PUMPBTCOMM, "Gatt Connected.")
             bluetoothConnectionGatt?.device?.name?.let { deviceName ->
                 // Update stored name upon connecting (also for backwards compatibility for device where a name was not yet stored)
@@ -187,24 +230,100 @@ class RileyLinkBLE @Inject constructor(
                 rileyLinkServiceData.rileyLinkName = deviceName
                 rileyLinkServiceData.rileyLinkAddress = bluetoothConnectionGatt?.device?.address
             }
+            // 连接真正建立前挂上看门狗
+            scheduleConnectionWatchdog()
+        }
+    }
+
+    /**
+     * 安全释放旧 GATT：先 disconnect 再 close 并置空引用。
+     * 不依赖 onConnectionStateChange 回调，避免回调丢失时资源永久泄漏。
+     */
+    @SuppressLint("MissingPermission")
+    private fun safeCloseExistingGatt() {
+        val old = bluetoothConnectionGatt ?: return
+        aapsLogger.warn(LTag.PUMPBTCOMM, "Releasing previous GATT before reconnecting")
+        runCatching {
+            old.disconnect()
+            old.close()
+        }.onFailure { aapsLogger.error(LTag.PUMPBTCOMM, "Failed to release previous GATT: ${it.message}") }
+        bluetoothConnectionGatt = null
+        isConnected = false
+    }
+
+    /**
+     * 连接看门狗：若在超时时间内仍未连上，强制释放并重建连接，然后继续守着。
+     * 这是"必须手动重启 AAPS 才能恢复"的解药。
+     *
+     * 设计要点（幂等）：
+     *  - 用 watchdogScheduled 标记避免重复调度（多个入口都调用本方法）
+     *  - 只有 cancelConnectionWatchdog()（连接真正就绪）或 disconnect()（用户主动断开）才会停
+     *  - 每次触发后重新调度，因此会一直守着直到连上，不受"重复调度互相取消"影响
+     */
+    private fun scheduleConnectionWatchdog() {
+        if (watchdogScheduled) return
+        watchdogScheduled = true
+        watchdogHandler.postDelayed({
+            watchdogScheduled = false
+            if (isConnected) {
+                watchdogRestarts = 0
+                return@postDelayed
+            }
+            if (watchdogRestarts >= WATCHDOG_MAX_RESTARTS) {
+                aapsLogger.error(
+                    LTag.PUMPBTCOMM,
+                    "Connection watchdog: rebuilt $watchdogRestarts times without success, " +
+                        "waiting ${CONNECTION_WATCHDOG_RETRY_AFTER_GIVE_UP_MS / 1000}s before next attempt"
+                )
+                watchdogRestarts = 0
+                watchdogHandler.postDelayed({ scheduleConnectionWatchdog() }, CONNECTION_WATCHDOG_RETRY_AFTER_GIVE_UP_MS)
+                return@postDelayed
+            }
+            watchdogRestarts++
+            aapsLogger.error(
+                LTag.PUMPBTCOMM,
+                "Connection watchdog fired: not connected after ${CONNECTION_WATCHDOG_TIMEOUT_MS / 1000}s, " +
+                    "force rebuild (attempt $watchdogRestarts/$WATCHDOG_MAX_RESTARTS)"
+            )
+            // 清掉可能残留的 GATT，避免泄漏累积
+            safeCloseExistingGatt()
+            val useScanning = preferences.get(RileylinkBooleanPreferenceKey.OrangeUseScanning)
+            if (useScanning) orangeLink.startScan() else connectGattInternal()
+            // 继续守着
+            scheduleConnectionWatchdog()
+        }, CONNECTION_WATCHDOG_TIMEOUT_MS)
+    }
+
+    /** 连接成功或用户主动断开时取消看门狗并复位计数 */
+    private fun cancelConnectionWatchdog() {
+        watchdogScheduled = false
+        watchdogHandler.removeCallbacksAndMessages(null)
+        if (watchdogRestarts != 0) {
+            aapsLogger.debug(LTag.PUMPBTCOMM, "Connection watchdog reset (was $watchdogRestarts restarts)")
+            watchdogRestarts = 0
         }
     }
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
         isConnected = false
+        cancelConnectionWatchdog()
         aapsLogger.warn(LTag.PUMPBTCOMM, "Closing GATT connection")
         // Close old connection
         if (bluetoothConnectionGatt != null) {
             // Not sure if to disconnect or to close first..
             bluetoothConnectionGatt?.disconnect()
             manualDisconnect = true
+            // 关键修复：不再依赖 onConnectionStateChange(STATE_DISCONNECTED) 来触发 close()，
+            // 那条回调一旦丢失就会导致 GATT 资源永久占用。
+            close()
         }
     }
 
     @SuppressLint("MissingPermission")
     fun close() {
-        bluetoothConnectionGatt?.close()
+        runCatching { bluetoothConnectionGatt?.close() }
+            .onFailure { aapsLogger.error(LTag.PUMPBTCOMM, "close() failed: ${it.message}") }
         bluetoothConnectionGatt = null
     }
 
@@ -401,7 +520,19 @@ class RileyLinkBLE @Inject constructor(
                     aapsLogger.debug(LTag.PUMPBTCOMM, "We are in ${if (status == BluetoothProfile.STATE_CONNECTING) "Connecting" else "Disconnecting"} state.")
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkDisconnected)
-                    if (manualDisconnect) close()
+                    if (manualDisconnect) {
+                        close()
+                        manualDisconnect = false
+                        cancelConnectionWatchdog()
+                    } else {
+                        // 关键修复：非用户主动断开（链路自己掉了 / 厂商栈断开）时，
+                        // 原实现什么都不做，只能等上层重新发起，很容易永久卡住。
+                        // 这里释放可能残留的 GATT 并挂上看门狗，由看门狗负责自动重建连接。
+                        runCatching { gatt.close() }
+                        if (bluetoothConnectionGatt === gatt) bluetoothConnectionGatt = null
+                        isConnected = false
+                        scheduleConnectionWatchdog()
+                    }
                     aapsLogger.warn(LTag.PUMPBTCOMM, "RileyLink Disconnected.")
                 } else {
                     aapsLogger.warn(LTag.PUMPBTCOMM, String.format(Locale.ENGLISH, "Some other state: (status=%d, newState=%d)", status, newState))
@@ -466,6 +597,8 @@ class RileyLinkBLE @Inject constructor(
                     aapsLogger.info(LTag.PUMPBTCOMM, "Gatt device is RileyLink device: $rileyLinkFound")
                     if (rileyLinkFound) {
                         isConnected = true
+                        // 服务就绪才算真正连上，此时取消看门狗并复位重建计数
+                        cancelConnectionWatchdog()
                         rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkReady)
                     } else {
                         isConnected = false
@@ -473,10 +606,14 @@ class RileyLinkBLE @Inject constructor(
                             RileyLinkServiceState.RileyLinkError,
                             RileyLinkError.DeviceIsNotRileyLink
                         )
+                        // 设备不对劲也要能自愈
+                        scheduleConnectionWatchdog()
                     }
                 } else {
                     aapsLogger.debug(LTag.PUMPBTCOMM, "onServicesDiscovered " + getGattStatusMessage(status))
                     rileyLinkUtil.sendBroadcastMessage(RileyLinkConst.Intents.RileyLinkGattFailed)
+                    // GATT 服务发现失败：释放并交给看门狗重试
+                    scheduleConnectionWatchdog()
                 }
             }
         }
