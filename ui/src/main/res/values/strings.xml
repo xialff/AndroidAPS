@@ -181,4 +181,13 @@
         <item>Negative only</item>
     </string-array>
 
+    <!-- 治疗记录：胰岛素累计统计 -->
+    <string name="stats_total_insulin">Total insulin: %1$s</string>
+    <string name="stats_start_label">From: %1$s</string>
+    <string name="stats_clear_start">Clear statistics start</string>
+    <string name="stats_no_start_set">Long-press a treatment record to set the statistics start point</string>
+    <string name="stats_start_set">Statistics start set</string>
+    <string name="stats_start_cleared">Statistics start cleared</string>
+    <string name="stats_start_marker">STATS START</string>
+
 </resources>

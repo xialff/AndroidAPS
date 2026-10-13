@@ -10,6 +10,7 @@ import android.view.MenuInflater
 import android.view.MenuItem
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ImageButton
 import androidx.core.util.forEach
 import androidx.core.view.MenuProvider
 import androidx.lifecycle.Lifecycle
@@ -34,6 +35,9 @@ import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventTreatmentChange
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.fabric.FabricPrivacy
+import app.aaps.core.keys.LongNonKey
+import app.aaps.core.keys.StringNonKey
+import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.core.objects.extensions.iobCalc
 import app.aaps.core.objects.ui.ActionModeHelper
 import app.aaps.core.ui.dialogs.OKDialog
@@ -63,12 +67,20 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
     @Inject lateinit var uel: UserEntryLogger
     @Inject lateinit var persistenceLayer: PersistenceLayer
     @Inject lateinit var activePlugin: ActivePlugin
+    @Inject lateinit var preferences: Preferences
 
     private var _binding: TreatmentsBolusCarbsFragmentBinding? = null
 
     // This property is only valid between onCreateView and onDestroyView.
     private val binding get() = _binding!!
     private var menu: Menu? = null
+
+    /**
+     * 统计功能：所选起始记录的时间戳（0 = 未设置）。
+     * 通过 preferences 持久化，退出 AAPS 重新进入后依然保留，
+     * 直到用户选择新的起始记录或手动清除。
+     */
+    private var statsStartTimestamp: Long = 0L
 
     class MealLink(
         val bolus: BS? = null,
@@ -94,7 +106,65 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
         binding.recyclerview.layoutManager = LinearLayoutManager(view.context)
         binding.recyclerview.emptyView = binding.noRecordsText
         binding.recyclerview.loadingView = binding.progressBar
+
+        // 统计栏：恢复上次保存的起始点（跨进程持久化）
+        statsStartTimestamp = preferences.get(LongNonKey.TreatmentStatsStartTimestamp)
+        binding.statsClear.setOnClickListener { clearStatsStart() }
+
         requireActivity().addMenuProvider(this, viewLifecycleOwner, Lifecycle.State.RESUMED)
+    }
+
+    // ------------------------------------------------------------------
+    // 胰岛素累计统计
+    // ------------------------------------------------------------------
+
+    /**
+     * 计算从起始记录到现在的胰岛素总量，并刷新统计栏。
+     * 统计范围：所有有效的大剂量记录（含 SMB），使用与列表一致的 30 天查询窗口。
+     */
+    private fun updateStatsDisplay() {
+        val stats = binding.statsLayout ?: return
+        if (statsStartTimestamp <= 0L) {
+            stats.visibility = View.GONE
+            return
+        }
+        stats.visibility = View.VISIBLE
+
+        val now = System.currentTimeMillis()
+        val from = statsStartTimestamp.coerceAtLeast(now - millsToThePast)
+
+        disposable += persistenceLayer
+            .getBolusesFromTime(from, true)
+            .observeOn(aapsSchedulers.main)
+            .subscribe({ list ->
+                _binding ?: return@subscribe
+                val total = list.sumOf { it.amount }
+                binding.statsTotal.text = rh.gs(R.string.stats_total_insulin, rh.gs(app.aaps.core.ui.R.string.format_insulin_units, total))
+                val label = preferences.get(StringNonKey.TreatmentStatsStartLabel)
+                binding.statsStartLabel.text =
+                    if (label.isNotEmpty()) rh.gs(R.string.stats_start_label, label)
+                    else rh.gs(R.string.stats_start_label, dateUtil.dateAndTimeString(statsStartTimestamp))
+            }, fabricPrivacy::logException)
+    }
+
+    /** 把某条治疗记录设为统计起始点，并持久化 */
+    private fun setStatsStart(timestamp: Long, description: String) {
+        statsStartTimestamp = timestamp
+        preferences.put(LongNonKey.TreatmentStatsStartTimestamp, timestamp)
+        preferences.put(StringNonKey.TreatmentStatsStartLabel, dateUtil.dateAndTimeString(timestamp) + description)
+        ToastUtils.infoToast(context, R.string.stats_start_set)
+        updateStatsDisplay()
+        binding.recyclerview.adapter?.notifyDataSetChanged()
+    }
+
+    /** 清除统计起始点 */
+    private fun clearStatsStart() {
+        statsStartTimestamp = 0L
+        preferences.put(LongNonKey.TreatmentStatsStartTimestamp, 0L)
+        preferences.put(StringNonKey.TreatmentStatsStartLabel, "")
+        ToastUtils.infoToast(context, R.string.stats_start_cleared)
+        binding.statsLayout.visibility = View.GONE
+        binding.recyclerview.adapter?.notifyDataSetChanged()
     }
 
     private fun bolusMealLinksWithInvalid(now: Long) = persistenceLayer
@@ -138,6 +208,7 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
                     .observeOn(aapsSchedulers.main)
                     .subscribe { list ->
                         binding.recyclerview.swapAdapter(RecyclerViewAdapter(list), true)
+                        updateStatsDisplay()
                     }
             else
                 carbsMealLinks(now)
@@ -152,6 +223,7 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
                     .observeOn(aapsSchedulers.main)
                     .subscribe { list ->
                         binding.recyclerview.swapAdapter(RecyclerViewAdapter(list), true)
+                        updateStatsDisplay()
                     }
 
     }
@@ -195,6 +267,10 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
             val newDay = position == 0 || !dateUtil.isSameDayGroup(timestamp(ml), timestamp(mealLinks[position - 1]))
             holder.binding.date.visibility = newDay.toVisibility()
             holder.binding.date.text = if (newDay) dateUtil.dateStringRelative(timestamp(ml), rh) else ""
+
+            // 统计起始点标记：在起始记录上显示徽标
+            holder.binding.statsStartMarker.visibility =
+                (statsStartTimestamp > 0L && timestamp(ml) == statsStartTimestamp).toVisibility()
 
             // Metadata
             holder.binding.metadataLayout.visibility = (ml.bolusCalculatorResult != null && (ml.bolusCalculatorResult.isValid || showInvalidated)).toVisibility()
@@ -285,6 +361,25 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
 
         override fun getItemCount() = mealLinks.size
 
+        /**
+         * 根据列表位置找到"统计基准时间戳"。
+         * 一条记录可能同时有 bolus / carbs / 计算结果，任一时间戳匹配即可。
+         */
+        private fun timestampAt(position: Int): Long {
+            position.takeIf { it in mealLinks.indices } ?: return 0L
+            val ml = mealLinks[position]
+            return ml.bolus?.timestamp ?: ml.carbs?.timestamp ?: ml.bolusCalculatorResult?.timestamp ?: 0L
+        }
+
+        /** 生成起始点的可读描述，例如 " · 2.00U" 或 " · 30g" */
+        private fun descriptionAt(position: Int): String {
+            position.takeIf { it in mealLinks.indices } ?: return ""
+            val ml = mealLinks[position]
+            ml.bolus?.let { return " · " + rh.gs(app.aaps.core.ui.R.string.format_insulin_units, it.amount) }
+            ml.carbs?.let { return " · " + rh.gs(app.aaps.core.objects.R.string.format_carbs, it.amount.toInt()) }
+            return ""
+        }
+
         inner class MealLinkLoadedViewHolder internal constructor(view: View) : RecyclerView.ViewHolder(view) {
 
             val binding = TreatmentsBolusCarbsItemBinding.bind(view)
@@ -302,6 +397,16 @@ class TreatmentsBolusCarbsFragment : DaggerFragment(), MenuProvider {
                     }
                 }
                 binding.calculation.paintFlags = binding.calculation.paintFlags or Paint.UNDERLINE_TEXT_FLAG
+
+                // 长按整条记录 → 将其设为"胰岛素累计统计"的起始点
+                binding.root.setOnLongClickListener {
+                    val pos = bindingAdapterPosition
+                    if (pos == RecyclerView.NO_POSITION) return@setOnLongClickListener false
+                    val ts = timestampAt(pos)
+                    if (ts <= 0L) return@setOnLongClickListener false
+                    setStatsStart(ts, descriptionAt(pos))
+                    true
+                }
             }
         }
     }

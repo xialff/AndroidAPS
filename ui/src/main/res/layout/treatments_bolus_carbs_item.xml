@@ -18,6 +18,25 @@
         android:orientation="vertical">
 
         <TextView
+            android:id="@+id/stats_start_marker"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end"
+            android:layout_marginTop="3dp"
+            android:layout_marginEnd="6dp"
+            android:background="?attr/colorAccent"
+            android:paddingStart="6dp"
+            android:paddingTop="1dp"
+            android:paddingEnd="6dp"
+            android:paddingBottom="1dp"
+            android:text="@string/stats_start_marker"
+            android:textAppearance="?android:attr/textAppearanceSmall"
+            android:textColor="@android:color/white"
+            android:textStyle="bold"
+            android:visibility="gone"
+            tools:visibility="visible" />
+
+        <TextView
             android:id="@+id/date"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

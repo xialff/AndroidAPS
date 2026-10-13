@@ -16,5 +16,8 @@ enum class StringNonKey(
     ActivePumpType(key = "active_pump_type", defaultValue = ""),
     ActivePumpSerialNumber(key = "active_pump_serial_number", defaultValue = ""),
     SmsOtpSecret("smscommunicator_otp_secret", defaultValue = ""),
-    TotalBaseBasal("TBB", defaultValue = "10.00")
+    TotalBaseBasal("TBB", defaultValue = "10.00"),
+
+    /** 治疗统计：起始记录的可读描述（用于在统计栏显示"从哪条开始"）*/
+    TreatmentStatsStartLabel("treatment_stats_start_label", defaultValue = ""),
 }
