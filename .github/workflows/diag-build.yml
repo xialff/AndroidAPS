@@ -1,0 +1,216 @@
+name: Diag Build (artifact)
+
+# Purpose: build AAPS on the selected branch and upload the APK as a
+# downloadable Actions artifact, signed with the repo's keystore secrets.
+# Compatible with several common secret naming schemes.
+on:
+  workflow_dispatch:
+    inputs:
+      buildVariant:
+        description: 'Build Variant'
+        required: true
+        default: 'fullRelease'
+        type: choice
+        options:
+          - fullRelease
+          - fullDebug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build AAPS (artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
+
+      - name: Show what we are building
+        run: |
+          echo "ref   = ${{ github.ref }}"
+          echo "sha   = ${{ github.sha }}"
+          echo "actor = ${{ github.actor }}"
+          git log -1 --stat
+
+      - name: Decode keystore
+        env:
+          KEYSTORE_SET: ${{ secrets.KEYSTORE_SET }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_FILE: ${{ secrets.STORE_FILE }}
+          KS_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/keystore"
+          KS_FILE="$RUNNER_TEMP/keystore/keystore.jks"
+          ALIAS=""
+          STORE_PW=""
+          KEY_PW=""
+          echo "secret presence: KEYSTORE_SET=${KEYSTORE_SET:+set} KEYSTORE_BASE64=${KEYSTORE_BASE64:+set} STORE_FILE=${STORE_FILE:+set}"
+          echo "secret presence: STORE_PASSWORD=${STORE_PASSWORD:+set} KEY_ALIAS=${KEY_ALIAS:+set} KEY_PASSWORD=${KEY_PASSWORD:+set}"
+
+          # 方案一: KEYSTORE_SET = base64(keystore|storePassword|keyAlias|keyPassword)
+          if [ -n "$KEYSTORE_SET" ]; then
+            echo "using KEYSTORE_SET"
+            DECODED=$(printf '%s' "$KEYSTORE_SET" | base64 -d 2>/dev/null || true)
+            KS_B64=$(printf '%s' "$DECODED" | cut -d'|' -f1)
+            STORE_PW=$(printf '%s' "$DECODED" | cut -d'|' -f2)
+            ALIAS=$(printf '%s' "$DECODED" | cut -d'|' -f3)
+            KEY_PW=$(printf '%s' "$DECODED" | cut -d'|' -f4)
+            printf '%s' "$KS_B64" | base64 -d > "$KS_FILE" 2>/dev/null || true
+          fi
+
+          # 方案二: KEYSTORE_BASE64 是 base64 编码的 keystore 内容
+          if [ ! -s "$KS_FILE" ] && [ -n "$KEYSTORE_BASE64" ]; then
+            echo "using KEYSTORE_BASE64"
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$KS_FILE" 2>/dev/null || true
+            STORE_PW="${STORE_PW:-$STORE_PASSWORD}"
+            ALIAS="${ALIAS:-$KEY_ALIAS}"
+            KEY_PW="${KEY_PW:-$KEY_PASSWORD}"
+          fi
+
+          # 方案三: STORE_FILE —— 仓库此处的约定是【仓库内路径】，不是 base64 内容
+          if [ ! -s "$KS_FILE" ] && [ -n "$STORE_FILE" ]; then
+            echo "using STORE_FILE = $STORE_FILE"
+            if [ -f "$STORE_FILE" ]; then
+              cp "$STORE_FILE" "$KS_FILE"
+            elif [ -f "$GITHUB_WORKSPACE/$STORE_FILE" ]; then
+              cp "$GITHUB_WORKSPACE/$STORE_FILE" "$KS_FILE"
+            else
+              # 兜底：尝试当作 base64 内容解码
+              printf '%s' "$STORE_FILE" | base64 -d > "$KS_FILE" 2>/dev/null || true
+            fi
+            STORE_PW="${STORE_PW:-$STORE_PASSWORD}"
+            ALIAS="${ALIAS:-$KEY_ALIAS}"
+            KEY_PW="${KEY_PW:-$KEY_PASSWORD}"
+          fi
+
+          if [ ! -s "$KS_FILE" ]; then
+            echo "::warning::keystore secret 未提供有效内容，回退到仓库自带的 keystore/demokeystore.jks"
+            echo "::warning::注意：demo 证书已被 AAPS 自身的吊销名单 (revoked_certs.txt) 吊销，此 APK 无法用于闭环"
+            if [ -f "$GITHUB_WORKSPACE/keystore/demokeystore.jks" ]; then
+              cp "$GITHUB_WORKSPACE/keystore/demokeystore.jks" "$KS_FILE"
+            fi
+          fi
+
+          # 别名兜底：仓库自带 demokeystore.jks 的真实别名是 diyaps
+          if [ -z "$ALIAS" ]; then
+            ALIAS="diyaps"
+            echo "alias 未提供，回退为 '$ALIAS'"
+          fi
+
+          if [ ! -s "$KS_FILE" ]; then
+            echo "::error::keystore 未能解析（密钥存在但内容不可用，或全部为空）"
+            ls -la "$GITHUB_WORKSPACE/keystore" || true
+            exit 1
+          fi
+
+          # 诊断：输出 keystore 真实信息（类型、别名、证书指纹），便于确诊
+          echo "---- keystore 诊断 ----"
+          ls -la "$KS_FILE"
+          file "$KS_FILE" || true
+          if [ -n "$STORE_PW" ]; then
+            if keytool -list -v -keystore "$KS_FILE" -storepass "$STORE_PW" 2>&1 | tee /tmp/kt.txt | grep -E 'Alias name|Your keystore contains|Entry type|SHA256:|Owner:' ; then
+              echo "keytool 读取成功（STORE_PASSWORD 与该 keystore 匹配）"
+            else
+              echo "::warning::keytool 用 STORE_PASSWORD 读取失败（密码不匹配或文件不是 keystore）"
+              head -5 /tmp/kt.txt || true
+            fi
+          fi
+          echo "----------------------"
+          echo "keystore 已就绪: $(stat -c%s "$KS_FILE") 字节, alias='$ALIAS'"
+
+          # 私钥口令(KEY_PASSWORD)缺失时，自动尝试候选口令并校验
+          pick_key_password() {
+            local cand
+            for cand in "$STORE_PW" "$KEY_PW" "androidaps" "diyaps" "android" ""; do
+              if [ -z "$cand" ]; then continue; fi
+              if keytool -list -keystore "$KS_FILE" -storepass "$STORE_PW" -alias "$ALIAS" -keypass "$cand" > /dev/null 2>&1; then
+                echo "$cand"
+                return 0
+              fi
+            done
+            return 1
+          }
+          if [ -n "$STORE_PW" ]; then
+            PICKED=$(pick_key_password || true)
+            if [ -n "$PICKED" ]; then
+              KEY_PW="$PICKED"
+              echo "私钥口令校验通过（已选出口令，长度 ${#KEY_PW}）"
+            else
+              echo "::warning::未能确定私钥口令，打包签名可能失败；请补充 KEY_PASSWORD secret"
+            fi
+          fi
+
+          echo "KEYSTORE_FILE=$KS_FILE" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$STORE_PW" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$ALIAS" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$KEY_PW" >> $GITHUB_ENV
+
+      - name: Load JDK version
+        run: |
+          JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
+          echo "JAVA_VERSION=$JAVA_VERSION" >> $GITHUB_ENV
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Extract VERSION
+        run: |
+          VERSION=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version: $VERSION"
+
+      - name: Build APK
+        run: |
+          ./gradlew :app:assemble${{ github.event.inputs.buildVariant }} \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            -Dkotlin.daemon.jvm.options="-Xmx2g" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.daemon=true \
+            -Dorg.gradle.workers.max=8 \
+            -Dorg.gradle.caching=true \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Collect and rename APK
+        run: |
+          set -e
+          VARIANT="${{ github.event.inputs.buildVariant }}"
+          FLAVOR=$(echo "$VARIANT" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
+          TYPE=$(echo "$VARIANT" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
+          SRC="app/build/outputs/apk/${FLAVOR}/${TYPE}"
+          echo "source dir: $SRC"
+          ls -la "$SRC"
+          mkdir -p out
+          for f in "$SRC"/*.apk; do
+            cp "$f" "out/aaps-diag-${VERSION}-${VARIANT}.apk"
+          done
+          ls -la out/
+          sha256sum out/*.apk
+
+      - name: Verify APK signature
+        run: |
+          APK=$(ls out/*.apk | head -1)
+          echo "verifying: $APK"
+          $ANDROID_HOME/build-tools/*/apksigner verify --print-certs -v "$APK" || echo "apksigner 不可用，跳过"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-diag-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 7
