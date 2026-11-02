@@ -23,7 +23,7 @@ import app.aaps.pump.common.hw.rileylink.defs.RileyLinkError
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkPumpDevice
 import app.aaps.pump.common.hw.rileylink.defs.RileyLinkServiceState
 import app.aaps.pump.common.hw.rileylink.keys.RileyLinkDoubleKey
-import app.aaps.pump.common.hw.rileylink.keys.RileyLinkStringPreferenceKey
+import app.aaps.pump.common.hw.rileylink.keys.RileyLinkStringKey
 import app.aaps.pump.common.hw.rileylink.service.tasks.InitializePumpManagerTask
 import app.aaps.pump.common.hw.rileylink.service.tasks.ServiceTaskExecutor
 import dev.zacsweers.metro.HasMemberInjections
@@ -249,7 +249,8 @@ abstract class RileyLinkService : Service() {
         ) return
 
         // 用户主动断开（未配置 RL 地址）后不要自动重连
-        if (preferences.get(RileyLinkStringPreferenceKey.MacAddress).isEmpty()) return
+        // 4.0：MacAddress 位于 RileyLinkStringKey（3.x 在 RileyLinkStringPreferenceKey）
+        if (preferences.get(RileyLinkStringKey.MacAddress).isEmpty()) return
 
         // 泵正在执行命令（例如正在输注）时绝不打断
         if (isPumpBusy()) {
