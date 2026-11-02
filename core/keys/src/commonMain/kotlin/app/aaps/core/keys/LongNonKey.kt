@@ -44,5 +44,12 @@ enum class LongNonKey(
     NsClientControlColdSignedAt("nsclient_control_cold_signed_at", 0L, exportable = false),
     NsClientControlHotSignedAt("nsclient_control_hot_signed_at", 0L, exportable = false),
     LastVacuumRun("last_vacuum_run", 0L),
+
+    /**
+     * 治疗记录页签的"胰岛素累计统计"起始点：所选治疗记录的时间戳（0 = 未设置）。
+     * 从该记录开始累计到现在的胰岛素总量；持久化保存，退出重启后依然保留，
+     * 直到用户点选新的起始记录或清除。
+     */
+    TreatmentStatsStartTimestamp("treatment_stats_start_timestamp", 0L),
 }
 

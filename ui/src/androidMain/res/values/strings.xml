@@ -382,4 +382,11 @@
     <string name="cal_precheck_mark_sensor_change">Mark sensor change</string>
     <string name="graph_therapy_event_bg_with_note" comment="Shown when the user taps a BG check in the overview graph. %1$s = glucose with its unit, %2$s = the note the user wrote. Example: 6.1 mmol/L, before lunch">%1$s, %2$s</string>
 
+    <!-- Treatment records: accumulated insulin statistics -->
+    <string name="stats_total_insulin" comment="Total insulin accumulated since the chosen start record. %1$s = amount with unit, e.g. 12.35 U">Total: %1$s</string>
+    <string name="stats_start_label" comment="Start record of the insulin statistics. %1$s = date and time">From: %1$s</string>
+    <string name="stats_clear_start">Clear statistics start</string>
+    <string name="stats_start_marker">START</string>
+    <string name="stats_hint" comment="Hint shown when no statistics start is set">Tap a treatment record to set the statistics start</string>
+
 </resources>

@@ -1,6 +1,7 @@
 package app.aaps.ui.compose.treatments
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,13 +10,16 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -58,6 +62,7 @@ import app.aaps.core.ui.compose.stringResource
 import app.aaps.core.ui.compose.styledStringResource
 import app.aaps.ui.compose.components.ContentContainer
 import app.aaps.ui.compose.treatments.viewmodels.BolusCarbsViewModel
+import app.aaps.ui.UiStrings
 
 /**
  * Composable screen displaying boluses and carbs in a combined list.
@@ -104,46 +109,60 @@ fun BolusCarbsScreen(
 
     AapsTheme {
         Box(modifier = Modifier.fillMaxSize()) {
-            ContentContainer(
-                isLoading = uiState.isLoading,
-                isEmpty = uiState.mealLinks.isEmpty()
-            ) {
-                val haptic = LocalHapticFeedback.current
+            Column(modifier = Modifier.fillMaxSize()) {
+                // 胰岛素累计统计栏：仅在设置了起始记录后显示
+                if (uiState.statsStartTimestamp > 0L) {
+                    InsulinStatsBar(
+                        totalInsulin = uiState.statsTotalInsulin,
+                        startLabel = uiState.statsStartLabel,
+                        onClear = { viewModel.clearStatsStart() }
+                    )
+                }
+                ContentContainer(
+                    isLoading = uiState.isLoading,
+                    isEmpty = uiState.mealLinks.isEmpty(),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    val haptic = LocalHapticFeedback.current
 
-                TreatmentLazyColumn(
-                    items = uiState.mealLinks,
-                    getTimestamp = { it.bolusCalculatorResult?.timestamp ?: it.bolus?.timestamp ?: it.carbs?.timestamp ?: 0L },
-                    getItemKey = { "b${it.bolus?.id}_c${it.carbs?.id}_bcr${it.bolusCalculatorResult?.id}" },
-                    rh = viewModel.rh,
-                    itemContent = { ml ->
-                        MealLinkItem(
-                            mealLink = ml,
-                            isRemovingMode = uiState.isRemovingMode,
-                            isSelected = ml in uiState.selectedItems,
-                            onClick = {
-                                if (uiState.isRemovingMode && ml.isValid()) {
-                                    // Haptic feedback for selection toggle
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    // Toggle selection
-                                    viewModel.toggleSelection(ml)
-                                }
-                            },
-                            onLongPress = {
-                                if (ml.isValid() && !uiState.isRemovingMode) {
-                                    // Haptic feedback for selection mode entry
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                    // Enter selection mode and select this item
-                                    viewModel.enterSelectionMode(ml)
-                                }
-                            },
-                            onCalculatorClick = { bcr -> showInfoBcr = bcr },
-                            profile = profile,
-                            showInvalidated = uiState.showInvalidated
-                        )
-                    }
-                )
+                    TreatmentLazyColumn(
+                        items = uiState.mealLinks,
+                        getTimestamp = { it.timestamp() },
+                        getItemKey = { "b${it.bolus?.id}_c${it.carbs?.id}_bcr${it.bolusCalculatorResult?.id}" },
+                        rh = viewModel.rh,
+                        itemContent = { ml ->
+                            MealLinkItem(
+                                mealLink = ml,
+                                isRemovingMode = uiState.isRemovingMode,
+                                isSelected = ml in uiState.selectedItems,
+                                isStatsStart = uiState.statsStartTimestamp > 0L && ml.timestamp() == uiState.statsStartTimestamp,
+                                onClick = {
+                                    if (uiState.isRemovingMode && ml.isValid()) {
+                                        // 删除模式：切换选择
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        viewModel.toggleSelection(ml)
+                                    } else if (!uiState.isRemovingMode) {
+                                        // 单击记录：设为胰岛素累计统计的起始点
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        viewModel.setStatsStart(ml)
+                                    }
+                                },
+                                onLongPress = {
+                                    if (ml.isValid() && !uiState.isRemovingMode) {
+                                        // Haptic feedback for selection mode entry
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        // Enter selection mode and select this item
+                                        viewModel.enterSelectionMode(ml)
+                                    }
+                                },
+                                onCalculatorClick = { bcr -> showInfoBcr = bcr },
+                                profile = profile,
+                                showInvalidated = uiState.showInvalidated
+                            )
+                        }
+                    )
+                }
             }
-
         }
     }
 }
@@ -157,6 +176,59 @@ data class MealLink(
     fun isValid(): Boolean {
         return (bolus?.isValid ?: true) && (carbs?.isValid ?: true) && (bolusCalculatorResult?.isValid ?: true)
     }
+
+    /** 该条记录的基准时间戳（用于排序与统计起始点识别） */
+    fun timestamp(): Long =
+        bolusCalculatorResult?.timestamp ?: bolus?.timestamp ?: carbs?.timestamp ?: 0L
+}
+
+/**
+ * 胰岛素累计统计栏：显示从所选起始记录到现在的胰岛素总量。
+ * 起始记录点选后持久化保存，退出重启依然显示，直到点选新的或点此栏的清除按钮。
+ */
+@Composable
+private fun InsulinStatsBar(
+    totalInsulin: Double,
+    startLabel: String,
+    onClear: () -> Unit
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(
+                        UiStrings.stats_total_insulin,
+                        stringResource(InterfacesStrings.format_insulin_units, totalInsulin)
+                    ),
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+                if (startLabel.isNotEmpty()) {
+                    Text(
+                        text = stringResource(UiStrings.stats_start_label, startLabel),
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
+                    )
+                }
+            }
+            IconButton(onClick = onClear) {
+                Icon(
+                    imageVector = Icons.Filled.Close,
+                    contentDescription = stringResource(UiStrings.stats_clear_start),
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+        }
+    }
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -165,6 +237,7 @@ private fun MealLinkItem(
     mealLink: MealLink,
     isRemovingMode: Boolean,
     isSelected: Boolean,
+    isStatsStart: Boolean,
     onClick: () -> Unit,
     onLongPress: () -> Unit,
     onCalculatorClick: (BCR) -> Unit,
@@ -187,6 +260,23 @@ private fun MealLinkItem(
         Column(
             modifier = Modifier.padding(1.dp)
         ) {
+
+            // 统计起始点徽标
+            if (isStatsStart) {
+                Text(
+                    text = stringResource(UiStrings.stats_start_marker),
+                    modifier = Modifier
+                        .padding(start = 8.dp, top = 4.dp)
+                        .background(
+                            color = MaterialTheme.colorScheme.primary,
+                            shape = RoundedCornerShape(4.dp)
+                        )
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimary
+                )
+            }
 
             // Bolus Calculator Result (Metadata)
             mealLink.bolusCalculatorResult?.let { bcr ->

@@ -22,6 +22,9 @@ import app.aaps.core.interfaces.rx.bus.RxBus
 import app.aaps.core.interfaces.rx.events.EventShowSnackbar
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.DecimalFormatter
+import app.aaps.core.keys.LongNonKey
+import app.aaps.core.keys.StringNonKey
+import app.aaps.core.keys.interfaces.Preferences
 import app.aaps.core.ui.clientcontrol.RecordRemoval
 import app.aaps.core.ui.compose.SelectableListToolbar
 import app.aaps.core.ui.compose.ToolbarConfig
@@ -53,13 +56,21 @@ class BolusCarbsViewModel(
     private val aapsLogger: AAPSLogger,
     private val rxBus: RxBus,
     batchExecutor: BatchExecutor,
-    config: Config
+    config: Config,
+    private val preferences: Preferences
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(BolusCarbsUiState())
     val uiState: StateFlow<BolusCarbsUiState> = _uiState.asStateFlow()
 
     init {
+        // 恢复上次保存的统计起始点（跨进程持久化）
+        _uiState.update {
+            it.copy(
+                statsStartTimestamp = preferences.get(LongNonKey.TreatmentStatsStartTimestamp),
+                statsStartLabel = preferences.get(StringNonKey.TreatmentStatsStartLabel)
+            )
+        }
         loadData()
         observeTreatmentChanges()
     }
@@ -107,10 +118,17 @@ class BolusCarbsViewModel(
                     it.bolusCalculatorResult?.timestamp ?: it.bolus?.timestamp ?: it.carbs?.timestamp ?: 0L
                 }
 
+                // 胰岛素累计统计：从所选起始记录到现在，所有有效大剂量之和
+                val startTs = uiState.value.statsStartTimestamp
+                val statsTotal = if (startTs > 0L) {
+                    persistenceLayer.getBolusesFromTime(startTs, false).sumOf { it.amount }
+                } else 0.0
+
                 _uiState.update {
                     it.copy(
                         mealLinks = mealLinks,
-                        isLoading = false
+                        isLoading = false,
+                        statsTotalInsulin = statsTotal
                     )
                 }
             } catch (e: Exception) {
@@ -184,6 +202,28 @@ class BolusCarbsViewModel(
     }
 
     /**
+     * 把选中的治疗记录设为"胰岛素累计统计"的起始点（单击记录触发）。
+     * 起始点持久化保存，退出重启后依然保留，直到选新的或清除。
+     */
+    fun setStatsStart(item: MealLink) {
+        val ts = item.timestamp()
+        if (ts <= 0L) return
+        val label = dateUtil.dateAndTimeString(ts)
+        preferences.put(LongNonKey.TreatmentStatsStartTimestamp, ts)
+        preferences.put(StringNonKey.TreatmentStatsStartLabel, label)
+        _uiState.update { it.copy(statsStartTimestamp = ts, statsStartLabel = label) }
+        loadData()
+    }
+
+    /** 清除统计起始点 */
+    fun clearStatsStart() {
+        preferences.put(LongNonKey.TreatmentStatsStartTimestamp, 0L)
+        preferences.put(StringNonKey.TreatmentStatsStartLabel, "")
+        _uiState.update { it.copy(statsStartTimestamp = 0L, statsStartLabel = "", statsTotalInsulin = 0.0) }
+        loadData()
+    }
+
+    /**
      * Get current profile
      */
     suspend fun getProfile() = profileFunction.getProfile()
@@ -241,4 +281,8 @@ data class BolusCarbsUiState(
     val showInvalidated: Boolean = false,
     val isRemovingMode: Boolean = false,
     val selectedItems: Set<MealLink> = emptySet(),
+    // 胰岛素累计统计（0 = 未设置起始点）
+    val statsStartTimestamp: Long = 0L,
+    val statsTotalInsulin: Double = 0.0,
+    val statsStartLabel: String = "",
 )

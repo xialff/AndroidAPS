@@ -123,4 +123,7 @@ enum class StringNonKey(
     NsClientControlMasterSigningKey(key = "nsclient_control_master_signing_key", defaultValue = "", exportable = false),
     NsClientControlMasterSigningKeyUrl(key = "nsclient_control_master_signing_key_url", defaultValue = "", exportable = false),
 
+    /** 治疗统计：起始记录的可读描述（用于统计栏显示"从哪条开始"） */
+    TreatmentStatsStartLabel(key = "treatment_stats_start_label", defaultValue = ""),
+
 }
