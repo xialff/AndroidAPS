@@ -29,7 +29,6 @@ import app.aaps.pump.common.hw.rileylink.service.tasks.ServiceTaskExecutor
 import dev.zacsweers.metro.HasMemberInjections
 import dev.zacsweers.metro.Inject
 import java.util.Locale
-import javax.inject.Provider
 
 /**
  * Created by andy on 5/6/18.
@@ -60,7 +59,8 @@ abstract class RileyLinkService : Service() {
     @Inject lateinit var rileyLinkBLE: RileyLinkBLE     // android-bluetooth management
     @Inject lateinit var rfSpy: RFSpy // interface for RL xxx Mhz radio.
     @Inject lateinit var serviceTaskExecutor: ServiceTaskExecutor
-    @Inject lateinit var initializePumpManagerTaskProvider: Provider<InitializePumpManagerTask>
+    // 4.0 用 Kotlin 函数类型替代 javax.inject.Provider（Metro 注入）
+    @Inject lateinit var initializePumpManagerTaskProvider: () -> InitializePumpManagerTask
 
     private val bluetoothAdapter: BluetoothAdapter? get() = (getSystemService(BLUETOOTH_SERVICE) as BluetoothManager?)?.adapter
     private var broadcastReceiver: RileyLinkBroadcastReceiver? = null
@@ -272,7 +272,7 @@ abstract class RileyLinkService : Service() {
         // 先让 BLE 层清掉可能残留的 GATT，再复用 AAPS 自己的初始化流程重建连接
         runCatching { rileyLinkBLE.reconnectIfNeeded() }
             .onFailure { aapsLogger.error(LTag.PUMPBTCOMM, "BLE reconnect failed: ${it.message}") }
-        serviceTaskExecutor.startTask(initializePumpManagerTaskProvider.get())
+        serviceTaskExecutor.startTask(initializePumpManagerTaskProvider())
     }
 
     /** 只对 RileyLink 类泵生效，其它泵驱动完全不受影响 */
