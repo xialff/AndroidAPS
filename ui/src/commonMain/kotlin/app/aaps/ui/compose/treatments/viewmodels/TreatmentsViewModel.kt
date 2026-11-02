@@ -19,6 +19,7 @@ import app.aaps.core.interfaces.userEntry.UserEntryPresentationHelper
 import app.aaps.core.interfaces.utils.DateUtil
 import app.aaps.core.interfaces.utils.DecimalFormatter
 import app.aaps.core.interfaces.utils.Translator
+import app.aaps.core.keys.interfaces.Preferences
 import dev.zacsweers.metro.AppScope
 import dev.zacsweers.metro.ContributesIntoMap
 import dev.zacsweers.metro.Inject
@@ -53,7 +54,8 @@ class TreatmentsViewModel(
     val rxBus: RxBus,
     // Removing a record goes through the master on every role, see BatchAction.Remove.
     val batchExecutor: BatchExecutor,
-    val config: Config
+    val config: Config,
+    val preferences: Preferences
 ) : ViewModel() {
 
     /**
@@ -75,7 +77,8 @@ class TreatmentsViewModel(
             aapsLogger = aapsLogger,
             rxBus = rxBus,
             batchExecutor = batchExecutor,
-            config = config
+            config = config,
+            preferences = preferences
         )
     }
 
